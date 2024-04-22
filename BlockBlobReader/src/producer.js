@@ -4,11 +4,16 @@
 
 var sumoutils = require('./sumoutils.js');
 var { TableClient } = require("@azure/data-tables");
+
+var { ContainerClient } = require("@azure/storage-blob");
+var { DefaultAzureCredential } = require("@azure/identity");
+
 var tableClient = TableClient.fromConnectionString(process.env.APPSETTING_AzureWebJobsStorage,process.env.APPSETTING_TABLE_NAME);
 const MaxAttempts = 3
 const RetryInterval = 3000
 
-function getRowKey(metadata) {
+function getRowKey(metadata, context) {
+    context.log("SRi inside getRowKey");
     var storageName =  metadata.url.split("//").pop().split(".")[0];
     var arr = metadata.url.split('/').slice(3);
     var keyArr = [storageName];
@@ -16,7 +21,8 @@ function getRowKey(metadata) {
     return keyArr.join("-");
 }
 
-function getBlobMetadata(message) {
+function getBlobMetadata(message, context) {
+    context.log("SRi inside getBlobMetadata");
     var url = message.data.url;
     var data = url.split('/');
     var topicArr = message.topic.split('/');
@@ -33,12 +39,13 @@ function getBlobMetadata(message) {
     };
 }
 
-function getEntity(metadata, endByte, currentEtag) {
+function getEntity(metadata, endByte, currentEtag, context) {
+    context.log("SRi inside getEntity");
      //a single entity group transaction is limited to 100 entities. Also, the entire payload of the transaction may not exceed 4MB
     // rowKey/partitionKey cannot contain "/"
     var entity = {
         partitionKey: metadata.containerName,
-        rowKey: getRowKey(metadata),
+        rowKey: getRowKey(metadata, context),
         blobName: metadata.blobName,
         containerName: metadata.containerName,
         storageName: metadata.storageName,
@@ -53,35 +60,75 @@ function getEntity(metadata, endByte, currentEtag) {
     return entity;
 }
 
-function getContentLengthPerBlob(eventHubMessages, allcontentlengths, metadatamap) {
-    eventHubMessages.forEach(function (message) {
-        var metadata = getBlobMetadata(message);
-        var rowKey = getRowKey(metadata);
+async function getContentLengthPerBlob(eventHubMessages, allcontentlengths, metadatamap, context) {
+    context.log("SRi inside getBlobPointerMap");
+
+    for (const message of eventHubMessages) {
+        context.log("SRi inside eventHubMessages.forEach");
+        var metadata = getBlobMetadata(message, context);
+        var rowKey = getRowKey(metadata, context);
+
+        const task = {
+            storageName: metadata.storageName,
+            containerName: metadata.containerName,
+            blobName: metadata.blobName,
+            endByte: message.data.contentLength
+        };
+
+        blobService = await getBlockBlobService(context, metadata);
+        blobProperties = await blobService.getProperties();
+        var contentLength = blobProperties.contentLength;
+
+        if(contentLength == 0) {
+            context.log.error("SRi Error in messageHandler: blob size is 0");
+            context.done()
+        }
+
         metadatamap[rowKey] = metadata;
-        (allcontentlengths[rowKey] || (allcontentlengths[rowKey] = [])).push(message.data.contentLength);
-    });
+        (allcontentlengths[rowKey] || (allcontentlengths[rowKey] = [])).push(contentLength);
+    }
 }
 
+function getBlockBlobService(context, task) {
+    return new Promise(function (resolve, reject) {
+    try{
+        context.log("SRi Inside Block Blob Service")
+        var tokenCredential = new DefaultAzureCredential();
+        var containerClient = new ContainerClient(
+            `https://${task.storageName}.blob.core.windows.net/${task.containerName}`,
+            tokenCredential
+        );
+        var blockBlobClient = containerClient.getBlockBlobClient(task.blobName);
+        context.log("SRi Inside Block Blob Service before resolve")
+        resolve(blockBlobClient);
+        context.log("SRi Inside Block Blob Service after resolve")
+        } catch (err){
+            reject(err);
+        }
+    })};
+
 async function getBlobPointerMap(partitionKey, rowKey, context) {
+    context.log("SRi inside getBlobPointerMap");
     // Todo Add retries for node migration in cases of timeouts(non 400 & 500 errors)
     var statusCode = 200;
     try{
-        var entity = await tableClient.getEntity(partitionKey, rowKey);
-        //context.log("retreived existing rowkey: " + rowKey)
+        var entity = await tableClient.getEntity(partitionKey, rowKey, context);
+        context.log("retreived existing rowkey: " + rowKey)
     }catch(err){
         // err object keys : [ 'name', 'code', 'statusCode', 'request', 'response', 'details' ]
         if(err.statusCode === 404){
-            //context.log("no existing row found, new file scenario for rowkey: " + rowKey)
+            context.log("no existing row found, new file scenario for rowkey: " + rowKey)
             statusCode = 404;
         }else{
             throw err;
         }
     }
-    //context.log({statusCode: statusCode, entity: entity});
+    context.log({statusCode: statusCode, entity: entity});
     return {statusCode: statusCode, entity: entity};
 }
 
 async function updateBlobPointerMap(entity, context) {
+    context.log("SRi inside updateBlobPointerMap");
     let response;
     if(entity.options){
         let options = entity.options;
@@ -93,10 +140,13 @@ async function updateBlobPointerMap(entity, context) {
     return response;
 }
 
-function getNewTask(currentoffset,sortedcontentlengths,metadata){
+function getNewTask(currentoffset,sortedcontentlengths,metadata,context){
+    context.log("SRi inside getNewTask");
     var tasks = [];
     var lastoffset = currentoffset;
     var i, endByte, task;
+
+    context.log("SRi inside getNewTask sortedcontentlengths.length: " + sortedcontentlengths.length);
     for (i = 0; i < sortedcontentlengths.length; i += 1) {
         endByte = sortedcontentlengths[i] - 1;
         if (endByte > lastoffset) {
@@ -115,13 +165,13 @@ function getNewTask(currentoffset,sortedcontentlengths,metadata){
 }
 
 async function createTasksForBlob(partitionKey, rowKey, sortedcontentlengths, context, metadata) {
-    //context.log("inside createTasksForBlob", partitionKey, rowKey, sortedcontentlengths, metadata);
+    context.log("inside createTasksForBlob", partitionKey, rowKey, sortedcontentlengths, metadata);
     if (sortedcontentlengths.length === 0) {
         return Promise.resolve({status: "success", message: "No tasks created for rowKey: " + rowKey});
     }
     try{
         var retrievedResponse = await getBlobPointerMap(partitionKey, rowKey, context);
-        //context.log("retrieved blob pointer successsfully for rowkey: " + rowKey + " response: "+ retrievedResponse)
+        context.log("retrieved blob pointer successsfully for rowkey: " + rowKey + " response: "+ retrievedResponse)
     }catch(err){
        // unable to retrieve offset, hence ingesting whole file from starting byte
        let lastoffset = sortedcontentlengths[sortedcontentlengths.length - 1] - 1;
@@ -129,13 +179,14 @@ async function createTasksForBlob(partitionKey, rowKey, sortedcontentlengths, co
     }
     var currentoffset = retrievedResponse.statusCode === 404 ? -1 : Number(retrievedResponse.entity.offset);
     var currentEtag = retrievedResponse.statusCode === 404 ? null : retrievedResponse.entity.etag;
-    var [tasks,lastoffset] = getNewTask(currentoffset,sortedcontentlengths,metadata);
+    var [tasks,lastoffset] = getNewTask(currentoffset,sortedcontentlengths,metadata,context);
 
+    context.log("inside createTasksForBlob tasks.length: " + tasks.length);
     if (tasks.length > 0) { // modify offset only when it's been changed
-        var entity = getEntity(metadata, lastoffset, currentEtag);
+        var entity = getEntity(metadata, lastoffset, currentEtag, context);
         try{
             var updatedResponse = await updateBlobPointerMap(entity, context);
-            //context.log("updated blob pointer successsfully for rowkey: " + rowKey + " response: "+ updatedResponse)
+            context.log("updated blob pointer successsfully for rowkey: " + rowKey + " response: "+ updatedResponse)
             context.bindings.tasks = context.bindings.tasks.concat(tasks);
             return Promise.resolve({status: "success",rowKey: rowKey, message: tasks.length + " Tasks added for rowKey: " + rowKey});
         }catch(err){
@@ -151,14 +202,18 @@ async function createTasksForBlob(partitionKey, rowKey, sortedcontentlengths, co
 
 module.exports = async function (context, eventHubMessages) {
     try {
+        context.log("SRi 09-Apr-2024 0937pm module.exports");
+        context.log("SRi eventHubMessages: " + JSON.stringify(eventHubMessages));
         eventHubMessages = [].concat.apply([], eventHubMessages);
         var metadatamap = {};
         var allcontentlengths = {};
-        getContentLengthPerBlob(eventHubMessages, allcontentlengths, metadatamap);
+        await getContentLengthPerBlob(eventHubMessages, allcontentlengths, metadatamap, context);
+        context.log("SRi ln231 end of getContentLengthPerBlob");
         var processed = 0;
         context.bindings.tasks = [];
         var allRowPromises = [];
         var totalRows = Object.keys(allcontentlengths).length;
+        context.log("SRi ln 163 totalRows: " + totalRows);
         var errArr = [], rowKey;
         for (rowKey in allcontentlengths) {
             var sortedcontentlengths = allcontentlengths[rowKey].sort(); // ensuring increasing order of contentlengths
